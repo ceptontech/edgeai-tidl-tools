@@ -57,3 +57,7 @@ else()
     add_subdirectory(tidlrt_cpp/advanced_examples)
 endif()
 add_subdirectory(osrt_cpp/ort)
+# J722S only: needs itidl_ti.h from the target filesystem
+if(${TARGET_DEVICE} STREQUAL "am67a" AND ${TARGET_CPU} STREQUAL "arm")
+    add_subdirectory(osrt_cpp/retronet)
+endif()

@@ -8,3 +8,6 @@ lib
 model-artifacts
 models
 tools
+# retronet: local onnxruntime_tidl wheel and compile log
+pylib
+compile.log
