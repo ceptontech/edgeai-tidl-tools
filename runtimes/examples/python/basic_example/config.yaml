@@ -92,6 +92,14 @@ models:
       label_offset: 1
     runtime: onnxrt
 
+  # Custom model: 1-D network, input [1,4,1,520] -> logits [1,5,1,520].
+  # Not an image model, so no pre/post-processing is applied; 'random' input
+  # is used for calibration and inference.
+  retronet_v10_tidl_safe:
+    path: ../../data/models/retronet_v10_tidl_safe.onnx
+    inputs: random
+    runtime: onnxrt
+
   #TFLite Models
   cl-tfl-mobilenet_v1_1.0_224:
     path: ../../data/models/mobilenet_v1_1.0_224.tflite

@@ -15,6 +15,8 @@ usage() {
     echo "Options:"
     echo "  -h, --help              Display this help message"
     echo "  -c, --clean             Clean build directories without building"
+    echo "      --no-tvm            Exclude the TVM runtime wrapper and examples"
+    echo "      --no-ort-benchmark  Target ONNX Runtime lacks the TI benchmark API (older targetfs)"
     echo "  -t, --type TYPE         Build type: Debug or Release (default: Release)"
     echo "  -j, --jobs N            Number of parallel jobs for make (default: 4)"
     echo "  --wrapper-only          Build only the wrapper libraries"
@@ -33,6 +35,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         -c|--clean)
             CLEAN_ONLY=true
+            shift
+            ;;
+        --no-tvm)
+            CMAKE_EXTRA_ARGS="$CMAKE_EXTRA_ARGS -DBUILD_TVMRT=OFF"
+            shift
+            ;;
+        --no-ort-benchmark)
+            CMAKE_EXTRA_ARGS="$CMAKE_EXTRA_ARGS -DORT_TI_BENCHMARK_API=OFF"
             shift
             ;;
         -t|--type)
@@ -112,7 +122,7 @@ build_wrapper() {
     echo "Building wrapper libraries ($BUILD_TYPE)..."
     mkdir -p "$WRAPPER_BUILD_DIR"
     cd "$WRAPPER_BUILD_DIR"
-    cmake -DCMAKE_BUILD_TYPE=$BUILD_TYPE ..
+    cmake -DCMAKE_BUILD_TYPE=$BUILD_TYPE $CMAKE_EXTRA_ARGS ..
     make -j$JOBS
     if [ $? -ne 0 ]; then
         echo "Error: Failed to build wrapper libraries"
@@ -127,7 +137,7 @@ build_examples() {
     echo "Building examples ($BUILD_TYPE)..."
     mkdir -p "$EXAMPLES_BUILD_DIR"
     cd "$EXAMPLES_BUILD_DIR"
-    cmake -DCMAKE_BUILD_TYPE=$BUILD_TYPE ..
+    cmake -DCMAKE_BUILD_TYPE=$BUILD_TYPE $CMAKE_EXTRA_ARGS ..
     make -j$JOBS
     if [ $? -ne 0 ]; then
         echo "Error: Failed to build examples"

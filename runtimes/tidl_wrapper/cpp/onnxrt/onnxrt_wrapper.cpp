@@ -521,6 +521,12 @@ namespace onnxrt_wrapper
     const std::map<std::string, std::pair<float, std::string>> ONNXRT::getPerformance()
     {
         std::map<std::string, std::pair<float, std::string>> data;
+#ifdef ORT_NO_TI_BENCHMARK_API
+        /* Target filesystems older than 11_02 ship an ONNX Runtime that does not
+           provide OrtSessionGetTIBenchmarkData_Tidl. Inference is unaffected;
+           only the performance counters are unavailable. */
+        return data;
+#else
         c_api_tidl_benchmark_data benchmarkData;
 
         OrtSession* session = static_cast<OrtSession*>(*m_session);
@@ -559,7 +565,7 @@ namespace onnxrt_wrapper
         data["write_total"] = {(float)(writeTotal),"bytes"};
 
         return data;
-
+#endif /* ORT_NO_TI_BENCHMARK_API */
     }
 
     /**

@@ -447,6 +447,7 @@ public:
                 }
                 status = runInferenceWithSession(runConfig, session, modelName);
             }
+#ifdef BUILD_TVMRT
             else if (runConfig.runtime == "tvmrt")
             {
                 // Create TVMRT session
@@ -465,6 +466,7 @@ public:
                 }
                 status = runInferenceWithSession(runConfig, session, modelName);
             }
+#endif /* BUILD_TVMRT */
             else
             {
                 printf("[ERROR][%s] Invalid runtime %s\n", modelName.c_str(), runConfig.runtime.c_str());

@@ -190,7 +190,7 @@ if((${HOST_CPU} STREQUAL  "x86") AND (${TARGET_CPU}  STREQUAL  "x86"))
       stdc++fs
       onnxruntime
       tensorflow-lite
-      tvm_runtime
+      $<$<BOOL:${BUILD_TVMRT}>:tvm_runtime>
       ${TFLITE_2_12_LIBS}
       )
 
@@ -248,7 +248,7 @@ elseif((${HOST_CPU} STREQUAL  "aarch64") AND (${TARGET_CPU}  STREQUAL  "aarch64"
   set(SYSTEM_LINK_LIBS
       onnxruntime
       tensorflow-lite
-      tvm_runtime
+      $<$<BOOL:${BUILD_TVMRT}>:tvm_runtime>
       ${TFLITE_2_12_LIBS}
       )
 
@@ -309,6 +309,12 @@ elseif((${HOST_CPU} STREQUAL  "x86") AND (${TARGET_CPU}  STREQUAL  "aarch64"))
         ${TARGET_FS_PATH}/usr/include
         ${TARGET_FS_PATH}/usr/local/include
         ${TARGET_FS_PATH}/usr/include/processor_sdk/c7x-mma-tidl/arm-tidl/rt/inc/
+        ${TARGET_FS_PATH}/usr/include/processor_sdk/tidl_j7/arm-tidl/rt/inc/
+
+        # TIDL headers (itidl_rt.h / itidl_io.h) are architecture independent.
+        # Older target filesystems predate itidl_io.h, so fall back to the ones
+        # shipped with tidl_tools.
+        $ENV{TIDL_TOOLS_PATH}
 
         ${TARGET_FS_PATH}/usr/include/onnxruntime/include
         ${TARGET_FS_PATH}/usr/include/onnxruntime/include/onnxruntime/core/session
@@ -325,7 +331,7 @@ elseif((${HOST_CPU} STREQUAL  "x86") AND (${TARGET_CPU}  STREQUAL  "aarch64"))
     set(SYSTEM_LINK_LIBS
         onnxruntime
         tensorflow-lite
-        tvm_runtime
+        $<$<BOOL:${BUILD_TVMRT}>:tvm_runtime>
         ${TFLITE_2_12_LIBS}
         )
   

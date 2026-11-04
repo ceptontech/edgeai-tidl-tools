@@ -71,14 +71,18 @@ ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "onnxrt_wrapper.h"
 #include "tflitert_wrapper.h"
 #include "tidlrt_wrapper.h"
+#ifdef BUILD_TVMRT
 #include "tvmrt_wrapper.h"
+#endif
 #include "dltensor.h"
 #include "itidl_rt.h"
 
 using namespace onnxrt_wrapper;
 using namespace tflitert_wrapper;
 using namespace tidlrt_wrapper;
+#ifdef BUILD_TVMRT
 using namespace tvmrt_wrapper;
+#endif
 using namespace dl_tensor;
 
 #endif /* BASIC_EXAMPLE_H*/
