@@ -3,7 +3,8 @@
 # Uses the 11.01 onnxruntime_tidl wheel from ./pylib and tidl_tools from
 # ./tools/AM67A, so the system Python install is not touched.
 #
-# Usage: ./compile_retronet.sh [model.onnx] [out_dir]
+# Usage: ./compile_retronet.sh [model.onnx] [out_dir] [--cores N] [--batch B] [--rows R]
+# (see compile_retronet.py for what the options do)
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 export SOC=am67a
