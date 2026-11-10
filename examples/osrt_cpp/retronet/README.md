@@ -87,6 +87,74 @@ The input for item (b, r) is the strided slice `x[b][:][r][:]`. `retronet_main` 
 does not lay inputs out that way; use the 11.02 `runtimes/examples/cpp/retronet_example`,
 which detects the row count from the model.
 
+### Labels on the C7x
+
+```bash
+./compile_retronet.sh retro_dilated2d_best_fp16.onnx --labels --bits 16 --calib example_frame.npz
+```
+
+`--labels` ends the model with the label rule of `verify_onnx_example.py`, so the C7x
+returns the label per position, `[B, 1, H, W]` int64 (0 bg, 1 retro, 2 car, 3 cateye,
+4 bloom), instead of `[B, 5, H, W]` float logits:
+
+```
+p     = softmax over the 5 classes
+label = argmax(p[1:4]) + 1   where max(p[1:4]) > 0.2
+        4                    where p[4] > 0.5   (bloom wins)
+        0                    otherwise
+```
+
+TIDL has no Softmax across channels and no compare/select, so the rule is built from
+ops it does run:
+
+```
+Reshape [B,5,H,W] -> [B,1,5,H*W], Softmax(height), Reshape back      -> p
+1x1 Conv + Clip(0, 1): [e, p1-.2, p2-.2, p3-.2, s = 16 (p4-.5)]      -> c
+1x1 Conv + Relu:       [e, c1 - s, c2 - s, c3 - s, s]
+ArgMax (axis -3)
+```
+
+Without bloom the retro scores keep their full resolution; with bloom `s` pushes them
+down and wins. `e` (0.002 at 16 bits) keeps bg above TIDL's rounding floor: the bloom
+score never drops below one output step, so a smaller bg score lost every bg pixel to
+bloom. The cost against the float rule: retro needs `p > 0.202`, bloom `p4 > 0.500125`,
+and a retro class over 0.2 still beats bloom while `p4 < ~0.51`. The model is written as
+`<name>_b<B>[_r<R>]_labels[_16bit].onnx` next to the artifacts; pass it as `--model`.
+The compile fails if any node was left to the ARM.
+
+Use it at 16 bits: at 8 bits the network's own logits are too coarse (cateye is lost
+completely) and this head was not made to work there.
+
+### Calibration and precision
+
+`--calib example_frame.npz` calibrates on a real frame (the `verify_onnx_example.py`
+preprocessing, cut into the model's items, `--calib-frames` batches spread over the
+frame, default 20) instead of random input. `--bits 16` quantizes to 16 bits. For
+`retro_dilated2d_best_fp16.onnx` on `example_frame.npz` (TIDL host emulation, labels vs
+the same model in float, all 907,200 pixels; calibrated and tested on the same frame):
+
+| Build | Overall | bg | retro | cateye | bloom |
+|---|---|---|---|---|---|
+| 8-bit, random calibration | 34.18% | 34.7% | 1.9% | 0% | 0% |
+| 8-bit, `--calib` | 98.05% | 99.7% | 84.3% | 0% | 78.5% |
+| 16-bit, `--calib`, rule on the ARM | 99.70% | 99.9% | 97.6% | 85.1% | 96.9% |
+| 16-bit, `--calib`, `--labels` on the C7x | 99.71% | 99.9% | 97.6% | 85.0% | 96.9% |
+
+(1 car pixel in the frame.) 16-bit runs slower on the C7x than 8-bit; measure on the board.
+
+### Models the 11.01 import cannot take as exported
+
+`compile_retronet.py` writes a fixed copy of the model (and says so) when it has:
+
+- nodes out of execution order (`retro_dilated2d_best_fp16.onnx` lists its input
+  `Cast` after the Convs that read it): sorted
+- IR version 10: written as 9 (onnxruntime_tidl 1.15 reads up to 9)
+- float16 weights (TIDL: "data type 10 not supported"): converted to float32, which
+  is exact, and the fp32 <-> fp16 `Cast`s around them are removed
+
+`retro_dilated2d_best_fp16.onnx` takes `[B, 4, 520, 4]` and returns `[B, 5, 520, 4]`;
+`--rows` does not apply to it (height is 520, not 1).
+
 ## 2. Build `retronet_main` (cross-compile for aarch64)
 
 This needs the ARM GNU 13.2 toolchain in

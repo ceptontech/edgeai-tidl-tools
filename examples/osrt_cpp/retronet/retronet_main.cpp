@@ -2,11 +2,17 @@
  * Standalone runner for the retronet_v10_tidl_safe model (11_01 release
  * layout: ONNX Runtime C++ API with the TIDL execution provider).
  *
- * The model is not an image network: it takes a [1, 4, 1, 520] float tensor and
- * produces [1, 5, 1, 520] logits, i.e. a 5-class score for each of the 520
- * positions. There is therefore no image pre/post-processing here -- input is
- * either read verbatim from a raw float32 binary or generated, and the output
- * is written back as a raw float32 binary alongside an argmax class summary.
+ * The model is not an image network: it takes a [1, 4, H, W] float tensor and
+ * produces [1, 5, H, W] logits, i.e. a 5-class score for each of the H x W
+ * positions ([1, 4, 1, 520] for retronet_v10, [1, 4, 520, 4] for
+ * retro_dilated2d). There is therefore no image pre/post-processing here --
+ * input is either read verbatim from a raw float32 binary or generated, and
+ * the output is written back as a raw binary alongside an argmax class summary.
+ *
+ * Models compiled with compile_retronet.sh --labels end in the label rule of
+ * verify_onnx_example.py (softmax, retro/car/cateye over 0.2, bloom over 0.5),
+ * run on the C7x: the output is then the label per position, [1, 1, H, W]
+ * int64 (0 bg, 1 retro, 2 car, 3 cateye, 4 bloom), instead of the logits.
  *
  * Before the session is created, every *_tidl_io_*.bin in the artifacts folder
  * is checked against sizeof(sTIDL_IOBufDesc_t) as built for this SOC (J722S:
@@ -63,7 +69,7 @@ struct Args
     std::string model      = "retronet_v10_tidl_safe.onnx";
     std::string artifacts;
     std::string inputFile;
-    std::string outputFile = "retronet_logits.bin";
+    std::string outputFile;   /* default: retronet_logits.bin / retronet_labels.bin */
     int32_t     frames     = 1;
     int32_t     warmup     = 0;
     int32_t     debugLevel = 0;
@@ -99,7 +105,8 @@ void usage(const char *prog)
     printf("  --artifacts <dir>   Directory holding the compiled TIDL artifacts (required)\n");
     printf("  --model <path>      Path to retronet_v10_tidl_safe.onnx\n");
     printf("  --input <file>      Raw float32 input; generated if omitted\n");
-    printf("  --output <file>     Raw float32 output (default: retronet_logits.bin)\n");
+    printf("  --output <file>     Raw output: float32 logits (default: retronet_logits.bin),\n");
+    printf("                      or int64 labels for --labels models (retronet_labels.bin)\n");
     printf("  --frames <N>        Number of timed Run() calls (default: 1); each runs a\n");
     printf("                      full batch, i.e. one item per core in high-throughput mode\n");
     printf("  --warmup <N>        Untimed Run() calls before the timed ones (default: 0)\n");
@@ -366,9 +373,20 @@ int32_t fillInput(float *dst, int64_t batch, int64_t itemElems,
     return 0;
 }
 
-/* One output item is [numClasses, 1, numPositions] (shape is the full
- * [batch, numClasses, 1, numPositions]); report the winning class per position
- * so the run says something more useful than "it did not crash". */
+void printHistogram(const std::vector<int64_t> &histogram, int64_t numPositions)
+{
+    printf("Argmax class distribution over %ld positions:\n", (long)numPositions);
+    for (size_t c = 0; c < histogram.size(); c++)
+    {
+        printf("  class %zu : %6ld  (%5.1f%%)\n",
+               c, (long)histogram[c],
+               100.0 * (double)histogram[c] / (double)numPositions);
+    }
+}
+
+/* One output item is [numClasses, H, W] (shape is the full
+ * [batch, numClasses, H, W]); report the winning class per position so the
+ * run says something more useful than "it did not crash". */
 void summariseOutput(const float *src, const std::vector<int64_t> &shape)
 {
     if (shape.size() != 4)
@@ -378,7 +396,7 @@ void summariseOutput(const float *src, const std::vector<int64_t> &shape)
     }
 
     const int64_t numClasses   = shape[1];
-    const int64_t numPositions = shape[3];
+    const int64_t numPositions = shape[2] * shape[3];
 
     std::vector<int64_t> histogram(numClasses, 0);
 
@@ -397,17 +415,40 @@ void summariseOutput(const float *src, const std::vector<int64_t> &shape)
         }
         histogram[best]++;
     }
-
-    printf("Argmax class distribution over %ld positions:\n", (long)numPositions);
-    for (int64_t c = 0; c < numClasses; c++)
-    {
-        printf("  class %ld : %6ld  (%5.1f%%)\n",
-               (long)c, (long)histogram[c],
-               100.0 * (double)histogram[c] / (double)numPositions);
-    }
+    printHistogram(histogram, numPositions);
 }
 
-int32_t writeOutput(const float *src, int64_t elems, const std::string &file)
+/* Same summary for a --labels model: one item is [1, H, W] labels, already
+ * decided on the C7x. */
+void summariseClasses(const int64_t *src, const std::vector<int64_t> &shape)
+{
+    if (shape.size() != 4 || shape[1] != 1)
+    {
+        printf("[WARN] Unexpected output layout; skipping summary\n");
+        return;
+    }
+
+    const int64_t numPositions = shape[2] * shape[3];
+    std::vector<int64_t> histogram;
+    for (int64_t p = 0; p < numPositions; p++)
+    {
+        if (src[p] < 0 || src[p] > 255)
+        {
+            printf("[WARN] Class index %ld out of range at position %ld\n",
+                   (long)src[p], (long)p);
+            return;
+        }
+        if ((size_t)src[p] >= histogram.size())
+        {
+            histogram.resize(src[p] + 1, 0);
+        }
+        histogram[src[p]]++;
+    }
+    printHistogram(histogram, numPositions);
+}
+
+int32_t writeOutput(const void *src, int64_t elems, size_t elemSize, const char *typeName,
+                    const std::string &file)
 {
     std::ofstream ofs(file, std::ios::binary);
     if (!ofs)
@@ -415,13 +456,13 @@ int32_t writeOutput(const float *src, int64_t elems, const std::string &file)
         printf("[ERROR] Could not open output file: %s\n", file.c_str());
         return -1;
     }
-    ofs.write(reinterpret_cast<const char *>(src), (std::streamsize)(elems * sizeof(float)));
+    ofs.write(reinterpret_cast<const char *>(src), (std::streamsize)(elems * elemSize));
     if (!ofs)
     {
         printf("[ERROR] Failed writing %s\n", file.c_str());
         return -1;
     }
-    printf("Output written to %s (%ld elements, float32)\n", file.c_str(), (long)elems);
+    printf("Output written to %s (%ld elements, %s)\n", file.c_str(), (long)elems, typeName);
     return 0;
 }
 
@@ -479,20 +520,27 @@ int32_t run(const Args &args, const ArtifactInfo &info)
     std::vector<int64_t> inShape  = inType.GetTensorTypeAndShapeInfo().GetShape();
     std::vector<int64_t> outShape = outType.GetTensorTypeAndShapeInfo().GetShape();
 
-    if (inType.GetTensorTypeAndShapeInfo().GetElementType()  != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
-        outType.GetTensorTypeAndShapeInfo().GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+    /* Logits (float32), or labels (int64) from a --labels model */
+    const ONNXTensorElementDataType outElemType = outType.GetTensorTypeAndShapeInfo().GetElementType();
+    const bool classOutput = (outElemType == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);
+    if (inType.GetTensorTypeAndShapeInfo().GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+        (outElemType != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT && !classOutput))
     {
-        printf("[ERROR] Expected float32 input and output\n");
+        printf("[ERROR] Expected float32 input, and float32 logits or int64 class output\n");
         return -1;
     }
+    const size_t      outElemSize = classOutput ? sizeof(int64_t) : sizeof(float);
+    const char *const outTypeName = classOutput ? "int64 labels" : "float32 logits";
+    const std::string outputFile  = !args.outputFile.empty() ? args.outputFile
+                                  : classOutput ? "retronet_labels.bin" : "retronet_logits.bin";
     for (size_t i = 0; i < inShape.size(); i++)  { if (inShape[i]  < 1) inShape[i]  = 1; }
     for (size_t i = 0; i < outShape.size(); i++) { if (outShape[i] < 1) outShape[i] = 1; }
 
     const int64_t inElems  = numElements(inShape);
     const int64_t outElems = numElements(outShape);
     const int64_t batch    = inShape.empty() ? 1 : inShape[0];
-    printf("Tensors   : %s %ld floats -> %s %ld floats, batch %ld\n",
-           inName.get(), (long)inElems, outName.get(), (long)outElems, (long)batch);
+    printf("Tensors   : %s %ld floats -> %s %ld %s, batch %ld\n",
+           inName.get(), (long)inElems, outName.get(), (long)outElems, outTypeName, (long)batch);
 
     if (outShape.empty() || outShape[0] != batch)
     {
@@ -519,7 +567,7 @@ int32_t run(const Args &args, const ArtifactInfo &info)
     const std::vector<int64_t> outItemShape(outShape.begin(), outShape.end());
 
     float *inData  = static_cast<float *>(allocMem(inElems  * sizeof(float), args.offload));
-    float *outData = static_cast<float *>(allocMem(outElems * sizeof(float), args.offload));
+    void  *outData = allocMem(outElems * outElemSize, args.offload);
     int32_t status = (inData != NULL && outData != NULL) ? 0 : -1;
     if (status != 0)
     {
@@ -531,8 +579,9 @@ int32_t run(const Args &args, const ArtifactInfo &info)
         Ort::MemoryInfo memInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
         Ort::Value inTensor  = Ort::Value::CreateTensor<float>(memInfo, inData, inElems,
                                                                inShape.data(), inShape.size());
-        Ort::Value outTensor = Ort::Value::CreateTensor<float>(memInfo, outData, outElems,
-                                                               outShape.data(), outShape.size());
+        Ort::Value outTensor = Ort::Value::CreateTensor(memInfo, outData, outElems * outElemSize,
+                                                        outShape.data(), outShape.size(),
+                                                        outElemType);
         Ort::IoBinding binding(session);
         binding.BindInput(inName.get(), inTensor);
         binding.BindOutput(outName.get(), outTensor);
@@ -573,7 +622,16 @@ int32_t run(const Args &args, const ArtifactInfo &info)
                     {
                         printf("item %ld: ", (long)b);
                     }
-                    summariseOutput(outData + b * outItem, outItemShape);
+                    if (classOutput)
+                    {
+                        summariseClasses(static_cast<const int64_t *>(outData) + b * outItem,
+                                         outItemShape);
+                    }
+                    else
+                    {
+                        summariseOutput(static_cast<const float *>(outData) + b * outItem,
+                                        outItemShape);
+                    }
                 }
             }
         }
@@ -600,7 +658,7 @@ int32_t run(const Args &args, const ArtifactInfo &info)
 
         if (status == 0)
         {
-            status = writeOutput(outData, outElems, args.outputFile);
+            status = writeOutput(outData, outElems, outElemSize, outTypeName, outputFile);
         }
     }
 
