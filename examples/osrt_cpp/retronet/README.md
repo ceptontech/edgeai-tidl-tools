@@ -93,43 +93,58 @@ which detects the row count from the model.
 ./compile_retronet.sh retro_dilated2d_best_fp16.onnx --labels --bits 16 --calib example_frame.npz
 ```
 
-`--labels` ends the model with the label rule of `verify_onnx_example.py`, so the C7x
-returns the label per position, `[B, 1, H, W]` int64 (0 bg, 1 retro, 2 car, 3 cateye,
-4 bloom), instead of `[B, 5, H, W]` float logits:
+`--labels` ends the model with the label rule, so the C7x returns the label per
+position, `[B, 1, H, W]` int64 (0 bg, 1 retro, 2 car, 3 cateye, 4 bloom), instead of
+`[B, 5, H, W]` float logits. Give it the logits model (e.g. `best_2026-11-11.onnx`, not
+`best_2026-11-11_labels.onnx`):
 
 ```
 p     = softmax over the 5 classes
-label = argmax(p[1:4]) + 1   where max(p[1:4]) > 0.2
-        4                    where p[4] > 0.5   (bloom wins)
+label = argmax(p[1:4]) + 1   where max(p[1:4]) > T
+        4                    where p[4] > B   (bloom wins)
         0                    otherwise
 ```
+
+`T` and `B` come from the model's `retro_2d` metadata `inference_thresholds`
+(`t_retro`, `t_bloom`: 0.95 / 0.5 for `best_2026-11-11.onnx`), else they are those of
+`verify_onnx_example.py` (0.2 / 0.5); `--retro-p` / `--bloom-p` override them.
 
 TIDL has no Softmax across channels and no compare/select, so the rule is built from
 ops it does run:
 
 ```
-Reshape [B,5,H,W] -> [B,1,5,H*W], Softmax(height), Reshape back      -> p
-1x1 Conv + Clip(0, 1): [e, p1-.2, p2-.2, p3-.2, s = 16 (p4-.5)]      -> c
+Reshape [B,5,H,W] -> [B,1,5,H*W], Softmax(height), Reshape back          -> p
+1x1 Conv + Clip(0, 1): [e, p1-T+e, p2-T+e, p3-T+e, s = 16 (p4-B) + e]    -> c
 1x1 Conv + Relu:       [e, c1 - s, c2 - s, c3 - s, s]
 ArgMax (axis -3)
 ```
 
 Without bloom the retro scores keep their full resolution; with bloom `s` pushes them
-down and wins. `e` (0.002 at 16 bits) keeps bg above TIDL's rounding floor: the bloom
-score never drops below one output step, so a smaller bg score lost every bg pixel to
-bloom. The cost against the float rule: retro needs `p > 0.202`, bloom `p4 > 0.500125`,
-and a retro class over 0.2 still beats bloom while `p4 < ~0.51`. The model is written as
+down and wins. `e` (0.002 at 16 bits) keeps bg above TIDL's rounding floor: a score
+below its threshold is 0 (clipped) plus rounding, under `e`. The `+e` on the retro and
+bloom scores puts their thresholds exactly at `T` and `B`. In float the head matches the
+rule on every pixel of `example_frame.npz` for `best_2026-11-11.onnx` (T = 0.95, where a
+retro class over T and bloom can't meet). For T < 0.5 a retro class over T can still
+beat bloom while `2 s < p - T + e`. The model is written as
 `<name>_b<B>[_r<R>]_labels[_16bit].onnx` next to the artifacts; pass it as `--model`.
 The compile fails if any node was left to the ARM.
+
+For chameleon-b4 (one 64-line block per `Run()`, int64 labels):
+
+```bash
+./compile_retronet.sh best_2026-11-11.onnx --batch 16 --labels --bits 16 --calib example_frame.npz
+```
 
 Use it at 16 bits: at 8 bits the network's own logits are too coarse (cateye is lost
 completely) and this head was not made to work there.
 
 ### Calibration and precision
 
-`--calib example_frame.npz` calibrates on a real frame (the `verify_onnx_example.py`
-preprocessing, cut into the model's items, `--calib-frames` batches spread over the
-frame, default 20) instead of random input. `--bits 16` quantizes to 16 bits. For
+`--calib example_frame.npz` calibrates on a real frame instead of random input,
+preprocessed as the model's `retro_2d` metadata says (`spad_log_range_v2`: log
+intensity, distance/300, channels in `channel_names` order) or, for a model without
+it, as `verify_onnx_example.py` (d/308, i/432); cut into the model's items,
+`--calib-frames` batches spread over the frame, default 20. `--bits 16` quantizes to 16 bits. For
 `retro_dilated2d_best_fp16.onnx` on `example_frame.npz` (TIDL host emulation, labels vs
 the same model in float, all 907,200 pixels; calibrated and tested on the same frame):
 

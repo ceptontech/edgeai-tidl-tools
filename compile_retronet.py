@@ -27,30 +27,39 @@ each batch item one after another and pays its ~30-40k-cycle per-layer setup
 each time, but a taller tensor pays it once. Item r of batch b is row r, so
 the runner must lay the input out channel-major per batch: x[b][c][r][w].
 
---labels ends the model with the label rule of verify_onnx_example.py, so
-the C7x returns the label per position, [B, 1, H, W] int64 (0 bg, 1 retro,
-2 car, 3 cateye, 4 bloom), instead of the [B, 5, H, W] float logits:
+--labels ends the model with the label rule, so the C7x returns the label
+per position, [B, 1, H, W] int64 (0 bg, 1 retro, 2 car, 3 cateye, 4 bloom),
+instead of the [B, 5, H, W] float logits (give it the logits model, not one
+that already ends in labels):
     p = softmax over the 5 classes
-    label = argmax(p[1:4]) + 1 where max(p[1:4]) > 0.2, 4 where p4 > 0.5
+    label = argmax(p[1:4]) + 1 where max(p[1:4]) > T, 4 where p4 > B
     (bloom wins), else 0
+T and B are the model's retro_2d metadata inference_thresholds (t_retro,
+t_bloom; e.g. 0.95 / 0.5 for best_2026-11-11.onnx), else those of
+verify_onnx_example.py (0.2 / 0.5); --retro-p / --bloom-p override them.
 TIDL has no Softmax across channels and no compare/select, so it is built as
     Reshape [B,5,H,W] -> [B,1,5,H*W] -> Softmax(height) -> Reshape  -> p
     1x1 Conv + Clip(0, 1): [e, r1, r2, r3, s]
-        rm = pm - .2, s = 16 (p4 - .5), e = 0.002 (16-bit) / 0.03 (8-bit)
+        rm = pm - T + e, s = 16 (p4 - B) + e, e = 0.002 (16-bit) / 0.03 (8-bit)
     1x1 Conv + Relu:       [e, r1 - s, r2 - s, r3 - s, s]
     ArgMax(axis -3)
 Without bloom (s = 0) the retro scores are rm at full resolution and the
-largest wins over bg if above e; with bloom s pushes them down and wins.
-Weights stay within 16x of each other (8-bit weights lose a 1 next to a 1000)
-and bg wins rounding noise through e. Differences from the float rule: retro
-needs pm > .2 + e, bloom p4 > .5 + e/16, and a retro class over .2 still beats
-bloom if p4 < ~.51. The
+largest wins over bg (e) when pm > T; with bloom (p4 > B, s > e) s pushes
+them down and wins. Weights stay within 16x of each other (8-bit weights lose
+a 1 next to a 1000) and bg wins rounding noise through e: a score below its
+threshold is 0 (clipped) plus rounding. Differences from the float rule
+(none for T >= 0.5, where retro over T and bloom can't meet): a retro class
+over T still beats bloom if 2 s < rm, and p4 within e/16 under B lowers the
+retro scores by s < e. The
 model is written next to the artifacts as <name>..._labels.onnx and must be
 given to retronet_main as --model. The compile fails if any node of it was
 left to the ARM.
 
---calib example_frame.npz calibrates on a real frame instead of random input:
-the verify_onnx_example.py preprocessing (d0/308, i0/432, d1/308, i1/432) cut
+--calib example_frame.npz calibrates on a real frame instead of random input,
+preprocessed as the model's retro_2d metadata input_spec says (normalization
+spad_log_range_v2: intensity -log(max(1 - min(i, 359)/360, 1e-5))/6,
+distance/300, in its channel_names order, e.g. i0 d0 i1 d1), or without that
+metadata as verify_onnx_example.py (d0/308, i0/432, d1/308, i1/432); cut
 into the model's items -- one column per row of the item for 520-wide models
 (retronet_v10, --rows), blocks of neighbouring columns for 520-high ones
 (retro_dilated2d) -- with --calib-frames batches spread evenly over the frame.
@@ -60,10 +69,16 @@ slower on the C7x.
 
 Usage (from this folder):
     ./compile_retronet.sh [model.onnx] [out_dir] [--cores N] [--batch B] [--rows R] [--labels]
+                          [--retro-p T] [--bloom-p B]
                           [--calib frame.npz [--calib-frames N]] [--bits 8|16]
+
+best_2026-11-11.onnx (logits) for chameleon-b4, one 64-line block per Run():
+    ./compile_retronet.sh best_2026-11-11.onnx --batch 16 --labels --bits 16 \
+                          --calib example_frame.npz
 """
 import argparse
 import glob
+import json
 import os
 import shutil
 import struct
@@ -84,10 +99,11 @@ J722S_NUM_C7X = 2
 # 94616 (AM62A/J721E/J721S2) or 378392 (J784S4/J742S2).
 J722S_IO_DESC_SIZE = 189208
 INFERENCE_MODES = {0: "default (single core)", 1: "high throughput", 2: "low latency"}
-# --labels output tensor name and thresholds (verify_onnx_example.py)
+# --labels output tensor name, and the thresholds of verify_onnx_example.py
+# for a model without retro_2d inference_thresholds metadata
 LABELS_OUTPUT = "retronet_label"
-RETRO_P = 0.2   # retro / car / cateye: probability over this
-BLOOM_P = 0.5   # bloom: probability over this, wins over retro
+RETRO_P_DEFAULT = 0.2   # retro / car / cateye: probability over this
+BLOOM_P_DEFAULT = 0.5   # bloom: probability over this, wins over retro
 BLOOM_K = 16.0    # --labels: bloom score s = BLOOM_K * (p4 - BLOOM_P), clipped to 1
 LABEL_EPS = {16: 0.002, 8: 0.03}   # --labels: bg score, per --bits
 
@@ -103,6 +119,12 @@ ap.add_argument("--rows", type=int, default=1,
 ap.add_argument("--labels", action="store_true",
                 help="end with the softmax + threshold label rule on the C7x: labels "
                      "[B, 1, H, W] int64 instead of [B, 5, H, W] logits")
+ap.add_argument("--retro-p", type=float, default=None,
+                help="--labels retro/car/cateye threshold (default: the model's t_retro, "
+                     f"else {RETRO_P_DEFAULT})")
+ap.add_argument("--bloom-p", type=float, default=None,
+                help="--labels bloom threshold (default: the model's t_bloom, "
+                     f"else {BLOOM_P_DEFAULT})")
 ap.add_argument("--calib", default=None,
                 help="calibrate on a real frame (example_frame.npz) instead of random input")
 ap.add_argument("--calib-frames", type=int, default=None,
@@ -217,14 +239,42 @@ def load_for_tidl(src):
     return m, fixes
 
 
-def calib_items(path, item):
+def retro_meta(m):
+    """The model's retro_2d metadata (dict), or None."""
+    for p in m.metadata_props:
+        if p.key == "retro_2d":
+            return json.loads(p.value)
+    return None
+
+
+def calib_items(path, item, meta):
     """Items of shape item = [4, H, W] cut from a real frame, preprocessed as
-    verify_onnx_example.py: channels d0/308, i0/432, d1/308, i1/432 over the
-    frame's 520 rows x columns. A 520-wide item holds one column per row (H
-    columns), a 520-high one W neighbouring columns."""
+    the model's retro_2d metadata says (spad_log_range_v2, channel_names),
+    or without it as verify_onnx_example.py: d0/308, i0/432, d1/308, i1/432.
+    The frame has 520 rows x columns. A 520-wide item holds one column per
+    row (H columns), a 520-high one W neighbouring columns."""
     d = np.load(path)
-    f = np.stack([d["dist_mat"] / 308.0, d["int_mat"] / 432.0,
-                  d["dist1_mat"] / 308.0, d["int1_mat"] / 432.0]).astype(np.float32)
+    raw = {"d0": d["dist_mat"], "i0": d["int_mat"], "d1": d["dist1_mat"], "i1": d["int1_mat"]}
+    spec = (meta or {}).get("input_spec") or {}
+    norm = spec.get("normalization") or (meta or {}).get("normalization")
+    if norm is None:
+        names = ["d0", "i0", "d1", "i1"]
+        f_int = lambda i: i / 432.0
+        f_dist = lambda x: x / 308.0
+        print("calibration preprocessing: verify_onnx_example.py (d0/308, i0/432, d1/308, i1/432)")
+    elif norm.get("name") == "spad_log_range_v2":
+        names = spec.get("channel_names") or meta.get("channel_names")
+        f_int = lambda i: -np.log(np.maximum(
+            1.0 - np.minimum(i, norm["intensity_clip_max"]) / norm["intensity_max"],
+            norm["log_floor"])) / norm["intensity_scale"]
+        f_dist = lambda x: x / norm["distance_scale_m"]
+        print(f"calibration preprocessing: spad_log_range_v2, channels {' '.join(names)}")
+    else:
+        sys.exit(f"ERROR: --calib: unknown input normalization {norm.get('name')!r} in the "
+                 "model's retro_2d metadata")
+    if sorted(names) != ["d0", "d1", "i0", "i1"]:
+        sys.exit(f"ERROR: --calib: unknown input channels {names}")
+    f = np.stack([f_dist(raw[n]) if n[0] == "d" else f_int(raw[n]) for n in names]).astype(np.float32)
     c, h, w = item
     rows, cols = f.shape[1:]
     if c != 4:
@@ -246,7 +296,7 @@ def set_io_shape(m, batch, rows):
         v.type.tensor_type.shape.dim[2].dim_value = rows
 
 
-def add_labels(m, bits):
+def add_labels(m, bits, retro_p, bloom_p):
     """End m in the label rule (see --labels above), from ops the C7x runs:
     [B, 5, H, W] logits -> [B, 1, H, W] int64 labels."""
     if len(m.graph.output) != 1:
@@ -261,15 +311,17 @@ def add_labels(m, bits):
     # float has 0, and rounds a smaller bg score to 0: then bloom wins every
     # bg pixel
     eps = LABEL_EPS[bits]
-    # 1x1 conv + clip(0, 1) on p: c = [eps, r1, r2, r3, s]
+    # 1x1 conv + clip(0, 1) on p: c = [eps, r1, r2, r3, s]. The retro and
+    # bloom scores are offset by +eps, so each beats bg (eps) exactly above
+    # its threshold; below it a score is 0 (clipped) plus rounding, under eps
     w1 = np.zeros((5, 5, 1, 1), np.float32)
     b1 = np.zeros(5, np.float32)
     b1[0] = eps
     for c in (1, 2, 3):
         w1[c, c] = 1.0
-        b1[c] = -RETRO_P
+        b1[c] = eps - retro_p
     w1[4, 4] = BLOOM_K
-    b1[4] = -BLOOM_K * BLOOM_P
+    b1[4] = eps - BLOOM_K * bloom_p
     # 1x1 conv + relu on c: [eps, r1 - s, r2 - s, r3 - s, s]
     w2 = np.zeros((5, 5, 1, 1), np.float32)
     w2[0, 0] = 1.0
@@ -307,6 +359,22 @@ def add_labels(m, bits):
         LABELS_OUTPUT, onnx.TensorProto.INT64, [dims[0], 1, dims[2], dims[3]]))
 
 
+def update_meta(m, meta):
+    """retro_2d metadata of the written model: its input/output shapes and,
+    with --labels, output_kind labels and the thresholds built in."""
+    meta = dict(meta)
+    shape = lambda v: [d.dim_value for d in v.type.tensor_type.shape.dim]
+    meta["input_shape"] = shape(m.graph.input[0])
+    meta["output_shape"] = shape(m.graph.output[0])
+    if LABELS:
+        meta["output_kind"] = "labels"
+        meta["labels_head"] = {"t_retro": RETRO_P, "t_bloom": BLOOM_P, "bits": args.bits,
+                               "classes": ["bg", "retro", "car", "cateye", "bloom"]}
+    for p in m.metadata_props:
+        if p.key == "retro_2d":
+            p.value = json.dumps(meta)
+
+
 def save_checked(m, dst, batch, rows):
     """Shape-infer m and save it to dst. Fails if the outputs do not infer to
     batch and rows, e.g. because a Reshape hardcodes them."""
@@ -326,6 +394,14 @@ os.makedirs(OUT)
 
 model_path = MODEL
 m, fixes = load_for_tidl(MODEL)
+META = retro_meta(m)
+if LABELS:
+    if META and META.get("output_kind") == "labels":
+        sys.exit(f"ERROR: --labels: {MODEL} already ends in labels; give it the logits model")
+    thresholds = (META or {}).get("inference_thresholds") or {}
+    RETRO_P = args.retro_p if args.retro_p is not None else thresholds.get("t_retro", RETRO_P_DEFAULT)
+    BLOOM_P = args.bloom_p if args.bloom_p is not None else thresholds.get("t_bloom", BLOOM_P_DEFAULT)
+    print(f"label rule: retro/car/cateye p > {RETRO_P}, bloom p4 > {BLOOM_P}")
 src_dims = [d.dim_value for d in m.graph.input[0].type.tensor_type.shape.dim]
 if src_dims[2] != 1 and ROWS != 1:
     sys.exit(f"ERROR: --rows needs a model with height 1, {MODEL} has {src_dims}")
@@ -336,7 +412,9 @@ if fixes or reshape or LABELS:
         print(f"model fixes for TIDL 11.01: {', '.join(fixes)}")
     set_io_shape(m, BATCH, height)
     if LABELS:
-        add_labels(m, args.bits)
+        add_labels(m, args.bits, RETRO_P, BLOOM_P)
+    if META:
+        update_meta(m, META)
     tag = f"_b{BATCH}" + (f"_r{ROWS}" if ROWS != 1 else "") + ("_labels" if LABELS else "")
     model_path = save_checked(m, os.path.join(os.path.dirname(OUT), f"{name}{tag}.onnx"),
                               BATCH, height)
@@ -352,7 +430,7 @@ print(f"inference_mode {INFERENCE_MODE} ({INFERENCE_MODES[INFERENCE_MODE]}), num
 
 # Calibration runs: TIDL collects activation ranges from these frames
 if CALIB:
-    items = calib_items(CALIB, shape[1:])
+    items = calib_items(CALIB, shape[1:], META)
     pick = np.linspace(0, len(items) - 1, N_CALIB * shape[0]).round().astype(int)
     print(f"calibration: {N_CALIB} batches of {shape[0]} from {len(items)} items of {CALIB}")
 for i in range(N_CALIB):
