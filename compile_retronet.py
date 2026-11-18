@@ -472,7 +472,14 @@ if LABELS:
     for _ in range(vals[0]):
         offloaded += vals[i]
         i += vals[i] + 1
+    # The nodes of the graph onnxruntime hands to TIDL (onnxrtMetaData.txt
+    # numGraphNodes), after its own fusions: fewer than in the .onnx when
+    # it folded some (e.g. retronet_v10: 51 in the file, 47 after)
     total = len(onnx.load(model_path).graph.node)
+    with open(os.path.join(OUT, "onnxrtMetaData.txt")) as fh:
+        for line in fh:
+            if line.startswith("numGraphNodes="):
+                total = int(line.split("=", 1)[1])
     if offloaded != total:
         print(f"ERROR: only {offloaded} of {total} nodes run on the C7x: the label rule "
               "would be split with the ARM")
